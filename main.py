@@ -45,6 +45,10 @@ print("Model path:", MODEL_PATH)
 
 app = Flask(__name__)
 app.config.from_object(Config)
+app.config.setdefault('SESSION_COOKIE_HTTPONLY', True)
+app.config.setdefault('SESSION_COOKIE_SAMESITE', 'Lax')
+app.config.setdefault('SESSION_COOKIE_SECURE', os.getenv('SESSION_COOKIE_SECURE', 'False').lower() == 'true')
+app.config.setdefault('SESSION_REFRESH_EACH_REQUEST', True)
 
 print("✅ Model loaded successfully")
 app.secret_key = Config.SECRET_KEY
@@ -130,6 +134,16 @@ def init_db():
 init_db()
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+def is_valid_email(email: str) -> bool:
+    if not email or not isinstance(email, str):
+        return False
+    return bool(EMAIL_REGEX.match(email.strip()))
+
+
+def is_recaptcha_enabled() -> bool:
+    return bool(app.config.get('RECAPTCHA_SITE_KEY') and app.config.get('RECAPTCHA_SECRET_KEY'))
+
 
 def send_otp_email_async(email, otp, fullname):
     """
@@ -454,40 +468,51 @@ def contact():
 def register():
     if request.method == "POST":
         try:
+            csrf_token = request.form.get("csrf_token", "")
             fullname = request.form.get("fullname", "").strip()
             email = request.form.get("email", "").strip()
             password = request.form.get("password", "").strip()
             confirm_password = request.form.get("confirm_password", "").strip()
             recaptcha_token = request.form.get("g-recaptcha-response", "").strip()
-            
-            if not all([fullname, email, password, confirm_password]):
-                flash("All fields are required.", "error")
+            recaptcha_required = is_recaptcha_enabled()
+
+            if not csrf_token or csrf_token != session.get('csrf_token'):
+                flash("Invalid form submission. Please refresh the page and try again.", "error")
+                logger.warning('CSRF token mismatch: form=%s session=%s', csrf_token, session.get('csrf_token'))
                 return redirect(url_for("register"))
-            
-            if len(password) < 6:
+
+            if not fullname:
+                flash("Full name is required.", "error")
+                return redirect(url_for("register"))
+            elif not email:
+                flash("Email is required.", "error")
+                return redirect(url_for("register"))
+            elif not password:
+                flash("Password is required.", "error")
+                return redirect(url_for("register"))
+            elif not confirm_password:
+                flash("Please confirm your password.", "error")
+                return redirect(url_for("register"))
+            elif len(password) < 6:
                 flash("Password must be at least 6 characters.", "error")
                 return redirect(url_for("register"))
-            
-            if password != confirm_password:
+            elif password != confirm_password:
                 flash("Passwords do not match.", "error")
                 return redirect(url_for("register"))
-            
-            if not is_valid_email(email):
+            elif not is_valid_email(email):
                 flash("Please enter a valid email address.", "error")
                 return redirect(url_for("register"))
-            
-            if not recaptcha_token:
+            elif recaptcha_required and not recaptcha_token:
                 flash("Please complete the reCAPTCHA verification.", "error")
                 return redirect(url_for("register"))
-            
-            if not verify_recaptcha(recaptcha_token):
+            elif recaptcha_required and not verify_recaptcha(recaptcha_token):
                 logger.warning('reCAPTCHA verification failed for email: %s', email)
                 flash("reCAPTCHA verification failed. Please try again.", "error")
                 return redirect(url_for("register"))
-            
+
             try:
                 with get_db() as conn:
-                    existing_user = conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+                    existing_user = conn.execute("SELECT id FROM users WHERE LOWER(email) = LOWER(?)", (email,)).fetchone()
                     if existing_user:
                         flash("Email already registered. Please login instead.", "error")
                         return redirect(url_for("login"))
@@ -495,10 +520,11 @@ def register():
                 logger.exception('Database error checking existing user: %s', db_error)
                 flash("Database error. Please try again later.", "error")
                 return redirect(url_for("register"))
-            
+
             otp = ''.join(random.choices('0123456789', k=6))
-            
             hashed_password = generate_password_hash(password)
+
+            session.permanent = True
             session['otp'] = otp
             session['otp_email'] = email
             session['otp_time'] = time.time()
@@ -509,20 +535,25 @@ def register():
                 'email': email,
                 'password': hashed_password
             }
-            
+
             thread = threading.Thread(target=send_otp_email_async, args=(email, otp, fullname), daemon=True)
             thread.start()
             logger.info("OTP email thread started for %s", email)
-            
+
             flash("OTP sent to your email. Please verify.", "success")
             return redirect(url_for("verify_otp"))
-        
+
         except Exception as e:
             logger.exception("Unexpected error during registration: %s", e)
             flash("An unexpected error occurred during registration. Please try again later.", "error")
             return redirect(url_for("register"))
-    
-    return render_template("register.html", recaptcha_site_key=app.config.get("RECAPTCHA_SITE_KEY"))
+
+    session['csrf_token'] = secrets.token_urlsafe(32)
+    return render_template(
+        "register.html",
+        recaptcha_site_key=app.config.get("RECAPTCHA_SITE_KEY"),
+        csrf_token=session.get('csrf_token')
+    )
 
 @app.route("/verify-otp", methods=["GET", "POST"])
 def verify_otp():
@@ -547,24 +578,37 @@ def verify_otp():
             return redirect(url_for("register"))
 
         if entered_otp == session['otp']:
+            if 'user_data' not in session:
+                flash("Session expired. Please complete registration again.", "error")
+                logger.warning('OTP verification failed because user_data is missing from session.')
+                return redirect(url_for("register"))
+
             # Save user to database
             user_data = session['user_data']
             try:
                 with get_db() as conn:
-                    conn.execute("INSERT INTO users (fullname, email, password, verified) VALUES (?, ?, ?, 1)",
-                               (user_data['fullname'], user_data['email'], user_data['password']))
+                    conn.execute(
+                        "INSERT INTO users (fullname, email, password, verified) VALUES (?, ?, ?, 1)",
+                        (user_data['fullname'], user_data['email'], user_data['password'])
+                    )
                     user_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-            except sqlite3.IntegrityError:
-                flash("Email already registered.", "error")
+            except sqlite3.IntegrityError as integrity_error:
+                logger.warning('Integrity error while inserting user %s: %s', user_data['email'], integrity_error)
+                flash("Email already registered. Please login instead.", "error")
+                return redirect(url_for("login"))
+            except sqlite3.Error as db_error:
+                logger.exception('Database error during user creation: %s', db_error)
+                flash("Database error. Please try again later.", "error")
                 return redirect(url_for("register"))
 
-            # Clear session
+            # Clear session data used for registration
             session.pop('otp', None)
             session.pop('otp_email', None)
             session.pop('otp_time', None)
             session.pop('user_data', None)
 
-            # Auto login
+            # Auto login with secure session
+            session.permanent = True
             session['user_id'] = user_id
             session['user_name'] = user_data['fullname']
 

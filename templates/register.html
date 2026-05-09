@@ -13,7 +13,8 @@
         </ul>
       {% endif %}
     {% endwith %}
-    <form method="post" action="/register" novalidate id="register-form">
+    <form method="post" action="{{ url_for('register') }}" novalidate id="register-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
       <div class="form-group">
         <label for="fullname">Full Name</label>
         <input type="text" id="fullname" name="fullname" placeholder="John Doe" required />
@@ -47,7 +48,7 @@
         <div id="recaptcha-error" class="recaptcha-error"></div>
       </div>
       {% endif %}
-      <button type="submit" class="btn btn-primary btn-block" id="submit-btn" disabled>Create Account</button>
+      <button type="submit" class="btn btn-primary btn-block" id="submit-btn">Create Account</button>
       <p class="small-text">Already have an account? <a href="{{ url_for('login') }}">Login</a></p>
     </form>
   </div>
